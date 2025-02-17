@@ -1,0 +1,96 @@
+const { expect } = require("chai");
+const { ethers } = require("hardhat");
+const { time } = require("@nomicfoundation/hardhat-network-helpers");
+
+describe("TokenFactory", function () {
+    let TokenFactory, factory, owner, addr1, addr2, feeReceiver, uniswapRouter, uniswapFactory;
+
+    beforeEach(async function () {
+        [owner, addr1, addr2, feeReceiver, uniswapRouter, uniswapFactory] = await ethers.getSigners();
+
+        // Deploy TokenFactory with correct arguments
+        TokenFactory = await ethers.getContractFactory("TokenFactory");
+        factory = await TokenFactory.deploy(
+            uniswapRouter.address,
+            uniswapFactory.address,
+            feeReceiver.address
+        );
+        await factory.deployed();
+    });
+
+    describe("Token Creation", function () {
+        it("Should create a basic token successfully", async function () {
+            const tx = await factory.createToken("Test Token", "TEST", ethers.utils.parseEther("1000000"));
+            const receipt = await tx.wait();
+
+            const event = receipt.events.find(e => e.event === "TokenCreated");
+            expect(event).to.exist;
+
+            const tokens = await factory.getTokens();
+            expect(tokens.length).to.equal(1);
+            expect(tokens[0].name).to.equal("Test Token");
+            expect(tokens[0].symbol).to.equal("TEST");
+            expect(tokens[0].totalSupply).to.equal(ethers.utils.parseEther("1000000"));
+            expect(tokens[0].owner).to.equal(owner.address);
+        });
+
+        it("Should fail with invalid parameters", async function () {
+            await expect(
+                factory.createToken("", "TEST", ethers.utils.parseEther("1000000"))
+            ).to.be.revertedWith("InvalidTokenParameters");
+        });
+    });
+
+    describe("Vesting Functionality", function () {
+        let token, tokenAddress;
+
+        beforeEach(async function () {
+            const tx = await factory.createToken("Test Token", "TEST", ethers.utils.parseEther("1000000"));
+            const receipt = await tx.wait();
+            const event = receipt.events.find(e => e.event === "TokenCreated");
+            tokenAddress = event.args.tokenAddress;
+            const Token = await ethers.getContractFactory("ERC20Token");
+            token = Token.attach(tokenAddress);
+        });
+
+        it("Should create a vesting schedule", async function () {
+            const amount = ethers.utils.parseEther("10000");
+            const duration = 365 * 24 * 3600;
+            const interval = 30 * 24 * 3600;
+
+            await factory.createVestingSchedule(tokenAddress, addr1.address, amount, duration, interval);
+            const schedule = await factory.vestingSchedules(tokenAddress, addr1.address);
+            expect(schedule.totalAmount).to.equal(amount);
+        });
+    });
+
+    describe("Transfer Limits", function () {
+        it("Should enforce max transaction limit", async function () {
+            await factory.updateTokenLimits(
+                tokenAddress,
+                ethers.utils.parseEther("10000"),
+                ethers.utils.parseEther("5000")
+            );
+        });
+    });
+
+    describe("Anti-Bot Protection", function () {
+        it("Should prevent trading during anti-bot period", async function () {
+            await factory.toggleAntiBot(tokenAddress, true);
+        });
+    });
+
+    describe("Fee Collection", function () {
+        it("Should collect platform fees correctly", async function () {
+            await factory.enableTrading(tokenAddress);
+        });
+    });
+
+    describe("Emergency Functions", function () {
+        it("Should pause and unpause contract", async function () {
+            await factory.pause();
+            await factory.unpause();
+        });
+    });
+});
+
