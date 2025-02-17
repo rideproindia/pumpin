@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/utils/Multicall.sol";
+import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+error InsufficientLiquidity();
+error MaxSupplyReached();
+error InvalidVestingParameters();
+error NotTokenOwner();
+error VestingAlreadyExists();
+error NoVestingFound();
+error VestingNotMatured();
+error InvalidTimeLock();
+error InvalidTokenParameters();
+error UnauthorizedTransfer();
+error ExceedsMaxSupply();
+error InvalidWhitelistProof();
+error TokenNotCreated();
+error TokenNotLaunched();
+error TokenAlreadyLaunched();
+error ZeroAddress();
+error InvalidAmount();
+
+contract TokenFactory is Ownable2Step, ReentrancyGuard, Pausable, Multicall {
+    using SafeERC20 for IERC20;
+
+    uint256 private constant MIN_LAUNCH_DURATION = 1 hours;
+    uint256 private constant MAX_SUPPLY = 1e27;
+    uint256 private constant MIN_VESTING_INTERVAL = 1 days;
+    uint256 private constant MAX_INT = 2**256 - 1;
+
+    struct TokenDetails {
+        address tokenAddress;
+        string name;
+        string symbol;
+        uint256 totalSupply;
+        address owner;
+        bool isLocked;
+        uint256 maxWalletSize;
+        uint256 maxTransactionAmount;
+        bool hasAntiBot;
+        uint256 timeLockDuration;
+        bool isLaunched;
+        bytes32 whitelistRoot;
+        uint256 launchPrice;
+    }
+
+    struct VestingSchedule {
+        uint256 totalAmount;
+        uint256 releasedAmount;
+        uint256 startTime;
+        uint256 duration;
+        uint256 interval;
+        bool isActive;
+        bool isRevocable;
+        uint256 cliffDuration;
+        address beneficiary; // Added beneficiary field for better tracking
+    }
+
+    // State variables
+    mapping(address => TokenDetails) public tokens;
+    mapping(address => bool) public isTokenCreated;
+    mapping(address => mapping(address => VestingSchedule)) public vestingSchedules;
+    mapping(address => bool) public antiBotProtection;
+    mapping(address => uint256) public tradingStartTime;
+    
+    // Added security features
+    mapping(address => uint256) public lastTransactionTime;
+    mapping(address => uint256) public transactionCount;
+    uint256 public constant RATE_LIMIT_DURATION = 1 hours;
+    uint256 public constant MAX_TRANSACTIONS_PER_HOUR = 100;
+
+    event TokenCreated(address indexed tokenAddress, string name, string symbol, uint256 totalSupply, address indexed owner, uint256 timestamp);
+    event VestingScheduleCreated(address indexed token, address indexed beneficiary, uint256 totalAmount, uint256 duration, uint256 timestamp);
+    event VestingRevoked(address indexed token, address indexed beneficiary, uint256 timestamp);
+    event TokenLaunched(address indexed token, uint256 launchPrice, uint256 timestamp);
+    event EmergencyShutdown(address indexed token, uint256 timestamp);
+    event VestingUpdated(address indexed token, address indexed beneficiary, uint256 newAmount, uint256 timestamp);
+
+    modifier validToken(address token) {
+        if (!isTokenCreated[token]) revert TokenNotCreated();
+        if (token == address(0)) revert ZeroAddress();
+        _;
+    }
+
+    modifier onlyTokenOwner(address token) {
+        if (msg.sender != tokens[token].owner) revert NotTokenOwner();
+        _;
+    }
+
+    modifier rateLimit() {
+        if (block.timestamp - lastTransactionTime[msg.sender] >= RATE_LIMIT_DURATION) {
+            transactionCount[msg.sender] = 0;
+        }
+        if (transactionCount[msg.sender] >= MAX_TRANSACTIONS_PER_HOUR) revert("Rate limit exceeded");
+        transactionCount[msg.sender]++;
+        lastTransactionTime[msg.sender] = block.timestamp;
+        _;
+    }
+
+    modifier nonZeroAddress(address _address) {
+        if (_address == address(0)) revert ZeroAddress();
+        _;
+    }
+
+    function createTokenAdvanced(
+        string calldata name,
+        string calldata symbol,
+        uint256 totalSupply,
+        uint256 maxWalletSize,
+        uint256 maxTransactionAmount,
+        bool enableAntiBot,
+        uint256 timeLockDuration,
+        bytes32 whitelistRoot
+    ) external nonReentrant whenNotPaused rateLimit returns (address) {
+        // Input validation
+        if (bytes(name).length == 0 || bytes(symbol).length == 0) revert InvalidTokenParameters();
+        if (totalSupply == 0 || totalSupply > MAX_SUPPLY) revert ExceedsMaxSupply();
+        if (timeLockDuration > 0 && timeLockDuration < MIN_LAUNCH_DURATION) revert InvalidTimeLock();
+        if (maxWalletSize > totalSupply) revert InvalidAmount();
+        if (maxTransactionAmount > maxWalletSize) revert InvalidAmount();
+
+        ERC20Token newToken = new ERC20Token(name, symbol, totalSupply, msg.sender, address(this));
+        address tokenAddress = address(newToken);
+
+        tokens[tokenAddress] = TokenDetails({
+            tokenAddress: tokenAddress,
+            name: name,
+            symbol: symbol,
+            totalSupply: totalSupply,
+            owner: msg.sender,
+            isLocked: false,
+            maxWalletSize: maxWalletSize,
+            maxTransactionAmount: maxTransactionAmount,
+            hasAntiBot: enableAntiBot,
+            timeLockDuration: timeLockDuration,
+            isLaunched: false,
+            whitelistRoot: whitelistRoot,
+            launchPrice: 0
+        });
+
+        isTokenCreated[tokenAddress] = true;
+        antiBotProtection[tokenAddress] = enableAntiBot;
+
+        emit TokenCreated(tokenAddress, name, symbol, totalSupply, msg.sender, block.timestamp);
+
+        return tokenAddress;
+    }
+
+    function createVestingSchedule(
+        address token,
+        address beneficiary,
+        uint256 amount,
+        uint256 duration,
+        uint256 interval,
+        uint256 cliffDuration,
+        bool isRevocable
+    ) external validToken(token) onlyTokenOwner(token) nonZeroAddress(beneficiary) nonReentrant returns (bool) {
+        if (vestingSchedules[token][beneficiary].isActive) revert VestingAlreadyExists();
+        if (duration < interval || interval < MIN_VESTING_INTERVAL) revert InvalidVestingParameters();
+        if (cliffDuration >= duration) revert InvalidVestingParameters();
+        if (amount == 0 || amount > IERC20(token).balanceOf(msg.sender)) revert InvalidAmount();
+
+        // Transfer tokens first to prevent reentrancy
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
+        vestingSchedules[token][beneficiary] = VestingSchedule({
+            totalAmount: amount,
+            releasedAmount: 0,
+            startTime: block.timestamp,
+            duration: duration,
+            interval: interval,
+            isActive: true,
+            isRevocable: isRevocable,
+            cliffDuration: cliffDuration,
+            beneficiary: beneficiary
+        });
+
+        emit VestingScheduleCreated(token, beneficiary, amount, duration, block.timestamp);
+        return true;
+    }
+
+    function launchToken(address token, uint256 initialPrice) 
+        external 
+        validToken(token) 
+        onlyTokenOwner(token) 
+        nonReentrant 
+        returns (bool) 
+    {
+        TokenDetails storage details = tokens[token];
+        if (details.isLaunched) revert TokenAlreadyLaunched();
+        if (initialPrice == 0) revert InvalidAmount();
+
+        details.isLaunched = true;
+        details.launchPrice = initialPrice;
+        tradingStartTime[token] = block.timestamp;
+
+        emit TokenLaunched(token, initialPrice, block.timestamp);
+        return true;
+    }
+
+    // Added emergency functions
+    function emergencyPause() external onlyOwner {
+        _pause();
+    }
+
+    function emergencyUnpause() external onlyOwner {
+        _unpause();
+    }
+
+    function emergencyShutdownToken(address token) 
+        external 
+        validToken(token) 
+        onlyTokenOwner(token) 
+        nonReentrant 
+    {
+        TokenDetails storage details = tokens[token];
+        details.isLocked = true;
+        emit EmergencyShutdown(token, block.timestamp);
+    }
+
+    // View functions with security checks
+    function getVestingSchedule(address token, address beneficiary) 
+        external 
+        view 
+        validToken(token) 
+        nonZeroAddress(beneficiary) 
+        returns (VestingSchedule memory) 
+    {
+        return vestingSchedules[token][beneficiary];
+    }
+
+    function getTokenDetails(address token) 
+        external 
+        view 
+        validToken(token) 
+        returns (TokenDetails memory) 
+    {
+        return tokens[token];
+    }
+}
+
+contract ERC20Token is ERC20, Ownable2Step {
+    TokenFactory public immutable factory;
+    uint256 private _totalSupply;
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    constructor(
+        string memory name, 
+        string memory symbol, 
+        uint256 totalSupply_, 
+        address owner, 
+        address _factory
+    ) ERC20(name, symbol) {
+        require(_factory != address(0), "Invalid factory address");
+        require(owner != address(0), "Invalid owner address");
+        
+        factory = TokenFactory(_factory);
+        _totalSupply = totalSupply_;
+        _balances[owner] = totalSupply_;
+        _transferOwnership(owner);
+        
+        emit Transfer(address(0), owner, totalSupply_);
+    }
+
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual override {
+        require(from != address(0), "ERC20: transfer from zero address");
+        require(to != address(0), "ERC20: transfer to zero address");
+        require(amount > 0, "ERC20: transfer amount must be greater than zero");
+        require(_balances[from] >= amount, "ERC20: transfer amount exceeds balance");
+
+        if (from != address(0) && to != address(0)) {
+            require(factory.isTokenCreated(address(this)), "Token not created");
+            require(factory.tradingStartTime(address(this)) > 0, "Token not launched");
+            
+            TokenFactory.TokenDetails memory details = factory.getTokenDetails(address(this));
+            require(!details.isLocked, "Token is locked");
+            
+            if (details.hasAntiBot) {
+                require(block.timestamp >= factory.tradingStartTime(address(this)) + details.timeLockDuration, "Trading not started");
+            }
+            
+            if (details.maxTransactionAmount > 0) {
+                require(amount <= details.maxTransactionAmount, "Exceeds max transaction amount");
+            }
+            
+            if (details.maxWalletSize > 0) {
+                require(_balances[to] + amount <= details.maxWalletSize, "Exceeds max wallet size");
+            }
+        }
+
+        super._beforeTokenTransfer(from, to, amount);
+    }
+}
